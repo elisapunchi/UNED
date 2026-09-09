@@ -141,6 +141,153 @@ def dividir_en_bloques(texto: str, tamano: int = TAMANO_BLOQUE):
 
 
 # ----------------------------------------------------------------------------
+# Resumen escrito: cálculo de estadísticas y armado del Word
+# ----------------------------------------------------------------------------
+def calcular_resumen(df: pd.DataFrame) -> dict:
+    """Calcula las tablas y conclusiones que después se muestran en pantalla y en el Word."""
+    resumen = {"total": len(df), "conteo_postura": df["Postura"].value_counts()}
+
+    if "Categoria" in df.columns:
+        ct = pd.crosstab(df["Categoria"], df["Postura"])
+        ct["Total"] = ct.sum(axis=1)
+        resumen["categoria_postura"] = ct.sort_values("Total", ascending=False)
+
+    if "Persona/Institución" in df.columns:
+        resumen["top_personas"] = df["Persona/Institución"].value_counts().head(8)
+
+    if "Archivo fuente" in df.columns and df["Archivo fuente"].nunique() > 1:
+        resumen["conteo_archivos"] = df["Archivo fuente"].value_counts()
+
+    # ---- Conclusiones automáticas, en texto plano ----
+    total = resumen["total"]
+    cp = resumen["conteo_postura"]
+    conclusiones = []
+
+    postura_top = cp.idxmax()
+    conclusiones.append(
+        f"La mayoría de los argumentos relevados están {postura_top.lower()} "
+        f"({cp.max() / total * 100:.0f}% del total)."
+    )
+
+    if "categoria_postura" in resumen:
+        ct = resumen["categoria_postura"]
+        cat_top = ct["Total"].idxmax()
+        conclusiones.append(
+            f'La categoría más discutida es "{cat_top}", con {ct.loc[cat_top, "Total"]} '
+            f"argumentos ({ct.loc[cat_top, 'Total'] / total * 100:.0f}% del total)."
+        )
+
+        if "A favor" in ct.columns and "En contra" in ct.columns:
+            candidatos = ct[ct["Total"] >= 2].copy()
+            if not candidatos.empty:
+                candidatos["pct_favor"] = candidatos["A favor"] / candidatos["Total"]
+                cat_favor = candidatos["pct_favor"].idxmax()
+                if candidatos.loc[cat_favor, "pct_favor"] > 0.5:
+                    conclusiones.append(
+                        f'"{cat_favor}" es la categoría con mayor proporción de argumentos a favor.'
+                    )
+                cat_contra = candidatos["pct_favor"].idxmin()
+                if candidatos.loc[cat_contra, "pct_favor"] < 0.5:
+                    conclusiones.append(
+                        f'"{cat_contra}" es la categoría con mayor proporción de argumentos en contra.'
+                    )
+
+    if "top_personas" in resumen:
+        actor_top = resumen["top_personas"].idxmax()
+        conclusiones.append(
+            f"El actor con más argumentos registrados es {actor_top}, "
+            f"con {resumen['top_personas'].max()}."
+        )
+
+    resumen["conclusiones"] = conclusiones
+    return resumen
+
+
+def mostrar_resumen_en_pantalla(df: pd.DataFrame, resumen: dict) -> None:
+    st.write(f"**Total de argumentos analizados:** {resumen['total']}")
+    for c in resumen["conclusiones"]:
+        st.markdown(f"- {c}")
+
+    with st.expander("Ver tablas del resumen"):
+        st.write("**Por postura**")
+        st.table(resumen["conteo_postura"])
+        if "categoria_postura" in resumen:
+            st.write("**Por categoría**")
+            st.table(resumen["categoria_postura"])
+        if "top_personas" in resumen:
+            st.write("**Actores más presentes**")
+            st.table(resumen["top_personas"])
+        if "conteo_archivos" in resumen:
+            st.write("**Por documento fuente**")
+            st.table(resumen["conteo_archivos"])
+
+
+def construir_resumen_docx(df: pd.DataFrame, resumen: dict) -> io.BytesIO:
+    from docx import Document
+    from docx.shared import Pt
+
+    doc = Document()
+    doc.styles["Normal"].font.name = "Arial"
+    doc.styles["Normal"].font.size = Pt(10)
+
+    doc.add_heading("Resumen de argumentos analizados", level=0)
+
+    n_docs = df["Archivo fuente"].nunique() if "Archivo fuente" in df.columns else None
+    subtitulo = f"Análisis de {resumen['total']} argumentos"
+    if n_docs:
+        subtitulo += f" extraídos de {n_docs} documento(s)"
+    parrafo = doc.add_paragraph()
+    parrafo.add_run(subtitulo).italic = True
+
+    def agregar_tabla(titulo, serie_o_df, nombre_columna_indice):
+        doc.add_heading(titulo, level=1)
+        if isinstance(serie_o_df, pd.Series):
+            tabla = doc.add_table(rows=1, cols=2)
+            tabla.style = "Light Grid Accent 1"
+            hdr = tabla.rows[0].cells
+            hdr[0].text, hdr[1].text = nombre_columna_indice, "Cantidad"
+            for indice, valor in serie_o_df.items():
+                fila = tabla.add_row().cells
+                fila[0].text = str(indice)
+                fila[1].text = str(valor)
+        else:
+            columnas = list(serie_o_df.columns)
+            tabla = doc.add_table(rows=1, cols=len(columnas) + 1)
+            tabla.style = "Light Grid Accent 1"
+            hdr = tabla.rows[0].cells
+            hdr[0].text = nombre_columna_indice
+            for i, col in enumerate(columnas):
+                hdr[i + 1].text = str(col)
+            for indice, fila_datos in serie_o_df.iterrows():
+                fila = tabla.add_row().cells
+                fila[0].text = str(indice)
+                for i, col in enumerate(columnas):
+                    fila[i + 1].text = str(fila_datos[col])
+
+    agregar_tabla("1. Panorama general (por postura)", resumen["conteo_postura"], "Postura")
+
+    if "categoria_postura" in resumen:
+        agregar_tabla(
+            "2. Distribución por categoría temática", resumen["categoria_postura"], "Categoría"
+        )
+
+    if "top_personas" in resumen:
+        agregar_tabla("3. Voces más presentes", resumen["top_personas"], "Persona/Institución")
+
+    if "conteo_archivos" in resumen:
+        agregar_tabla("4. Documentos fuente", resumen["conteo_archivos"], "Documento")
+
+    doc.add_heading("Conclusiones", level=1)
+    for c in resumen["conclusiones"]:
+        doc.add_paragraph(c, style="List Bullet")
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+# ----------------------------------------------------------------------------
 # Paso 1: subir archivo(s)
 # ----------------------------------------------------------------------------
 archivos = st.file_uploader(
@@ -430,11 +577,38 @@ if "df_resultado" in st.session_state:
         st.dataframe(tabla, use_container_width=True)
         st.session_state["df_resultado"] = df
 
-    csv_buffer = io.StringIO()
-    df.to_csv(csv_buffer, index=False)
-    st.download_button(
-        label="⬇️ Descargar CSV con resultados",
-        data=csv_buffer.getvalue(),
-        file_name="argumentos_categorizados.csv",
-        mime="text/csv",
-    )
+    st.subheader("📝 Resumen escrito")
+    resumen = calcular_resumen(df)
+    mostrar_resumen_en_pantalla(df, resumen)
+
+    excel_buffer = io.BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Argumentos")
+    excel_buffer.seek(0)
+
+    resumen_buffer = construir_resumen_docx(df, resumen)
+
+    col_desc1, col_desc2, col_desc3 = st.columns(3)
+    with col_desc1:
+        st.download_button(
+            label="⬇️ Descargar Excel con resultados",
+            data=excel_buffer,
+            file_name="argumentos_categorizados.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with col_desc2:
+        st.download_button(
+            label="⬇️ Descargar resumen (Word)",
+            data=resumen_buffer,
+            file_name="resumen_argumentos.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    with col_desc3:
+        csv_buffer = io.StringIO()
+        df.to_csv(csv_buffer, index=False)
+        st.download_button(
+            label="⬇️ Descargar CSV con resultados",
+            data=csv_buffer.getvalue(),
+            file_name="argumentos_categorizados.csv",
+            mime="text/csv",
+        )
