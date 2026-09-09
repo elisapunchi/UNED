@@ -426,6 +426,7 @@ Devolvé solo el JSON, sin texto adicional.
         )
         progreso = st.progress(0.0, text="Extrayendo argumentos...")
         filas_extraidas = []
+        errores_extraccion = []
 
         for i, (nombre_doc, bloque) in enumerate(bloques_con_origen):
             try:
@@ -444,7 +445,9 @@ Devolvé solo el JSON, sin texto adicional.
                     fila["Archivo fuente"] = nombre_doc
                     filas_extraidas.append(fila)
             except Exception as e:
-                st.warning(f"'{nombre_doc}', bloque {i + 1}: no se pudo procesar ({e}).")
+                mensaje = f"'{nombre_doc}', bloque {i + 1}: no se pudo procesar ({e})."
+                st.warning(mensaje)
+                errores_extraccion.append(mensaje)
             progreso.progress(
                 (i + 1) / len(bloques_con_origen),
                 text=f"Extrayendo... {i + 1}/{len(bloques_con_origen)}",
@@ -454,11 +457,24 @@ Devolvé solo el JSON, sin texto adicional.
 
         if filas_extraidas:
             piezas_df.append(pd.DataFrame(filas_extraidas))
+    else:
+        errores_extraccion = []
 
     if not piezas_df:
+        detalle = ""
+        if errores_extraccion:
+            ejemplos = "\n".join(f"- {e}" for e in errores_extraccion[:5])
+            detalle = (
+                f"\n\nDetalle de los errores encontrados (mostrando hasta 5 de "
+                f"{len(errores_extraccion)}):\n{ejemplos}\n\n"
+                "Si el mensaje menciona 'API key', 'quota', 'rate limit' o "
+                "'model', revisá tu clave de OpenAI o el modelo elegido en la "
+                "barra lateral: eso suele ser la causa cuando el mismo archivo "
+                "funcionó antes sin problema."
+            )
         st.error(
             "No se encontraron argumentos en ninguno de los documentos. Probá con otros "
-            "archivos o revisá la descripción del tema."
+            "archivos o revisá la descripción del tema." + detalle
         )
         st.stop()
 
