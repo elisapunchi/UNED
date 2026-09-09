@@ -34,8 +34,9 @@ st.set_page_config(page_title="Clasificador de argumentos", page_icon="📊", la
 
 st.title("📊 Clasificador de argumentos")
 st.caption(
-    "Subí cualquier archivo (PDF, Word, TXT, CSV o Excel) con el texto a analizar. "
-    "La app extrae los argumentos, los limpia y los clasifica automáticamente con un LLM."
+    "Subí uno o varios archivos (PDF, Word, TXT, CSV o Excel) con el texto a analizar. "
+    "La app extrae los argumentos de todos ellos, los junta, los limpia y los clasifica "
+    "automáticamente con un LLM."
 )
 
 COLUMNAS_TEXTO = [
@@ -140,54 +141,72 @@ def dividir_en_bloques(texto: str, tamano: int = TAMANO_BLOQUE):
 
 
 # ----------------------------------------------------------------------------
-# Paso 1: subir archivo
+# Paso 1: subir archivo(s)
 # ----------------------------------------------------------------------------
-archivo = st.file_uploader(
-    "Subí tu archivo (PDF, Word, TXT, CSV o Excel)",
+archivos = st.file_uploader(
+    "Subí uno o más archivos (PDF, Word, TXT, CSV o Excel)",
     type=["pdf", "docx", "txt", "csv", "xlsx", "xls"],
+    accept_multiple_files=True,
 )
 
-if archivo is None:
-    st.info("Esperando que subas un archivo para empezar.")
+if not archivos:
+    st.info("Esperando que subas al menos un archivo para empezar.")
     st.stop()
 
-nombre = archivo.name.lower()
-df_crudo = None
-texto_bruto = None
+st.write(f"📎 {len(archivos)} archivo(s) subido(s).")
 
-if nombre.endswith((".csv", ".xlsx", ".xls")):
-    try:
-        if nombre.endswith(".csv"):
-            df_tabla = pd.read_csv(archivo)
+# Cada elemento queda como: {"nombre", "tipo": "tabla"|"texto", "contenido": df o str}
+documentos = []
+
+for archivo in archivos:
+    nombre = archivo.name.lower()
+
+    if nombre.endswith((".csv", ".xlsx", ".xls")):
+        try:
+            if nombre.endswith(".csv"):
+                df_tabla = pd.read_csv(archivo)
+            else:
+                df_tabla = pd.read_excel(archivo)
+        except Exception as e:
+            st.error(f"No pude leer '{archivo.name}': {e}")
+            continue
+
+        if all(col in df_tabla.columns for col in COLUMNAS_TEXTO):
+            st.success(f"'{archivo.name}': ya tiene la tabla de argumentos lista, se usará directamente.")
+            documentos.append({"nombre": archivo.name, "tipo": "tabla", "contenido": df_tabla})
         else:
-            df_tabla = pd.read_excel(archivo)
-    except Exception as e:
-        st.error(f"No pude leer el archivo: {e}")
-        st.stop()
+            st.info(
+                f"'{archivo.name}': es una tabla sin las columnas esperadas, se tratará como texto."
+            )
+            documentos.append(
+                {"nombre": archivo.name, "tipo": "texto", "contenido": df_tabla.to_string(index=False)}
+            )
+    elif nombre.endswith(".pdf"):
+        documentos.append({"nombre": archivo.name, "tipo": "texto", "contenido": leer_pdf(archivo)})
+    elif nombre.endswith(".docx"):
+        documentos.append({"nombre": archivo.name, "tipo": "texto", "contenido": leer_docx(archivo)})
+    elif nombre.endswith(".txt"):
+        documentos.append({"nombre": archivo.name, "tipo": "texto", "contenido": leer_txt(archivo)})
 
-    if all(col in df_tabla.columns for col in COLUMNAS_TEXTO):
-        st.success("El archivo ya tiene la tabla de argumentos lista. Se usará directamente.")
-        df_crudo = df_tabla
-    else:
-        st.info(
-            "El archivo es una tabla pero no tiene las columnas esperadas: se va a tratar "
-            "su contenido como texto y extraer los argumentos con el LLM."
-        )
-        texto_bruto = df_tabla.to_string(index=False)
-elif nombre.endswith(".pdf"):
-    texto_bruto = leer_pdf(archivo)
-elif nombre.endswith(".docx"):
-    texto_bruto = leer_docx(archivo)
-elif nombre.endswith(".txt"):
-    texto_bruto = leer_txt(archivo)
+# Descartar documentos de texto vacíos
+documentos_validos = []
+for doc in documentos:
+    if doc["tipo"] == "texto" and not doc["contenido"].strip():
+        st.warning(f"'{doc['nombre']}': no se pudo extraer texto, se va a ignorar.")
+        continue
+    documentos_validos.append(doc)
+documentos = documentos_validos
 
-if texto_bruto is not None and not texto_bruto.strip():
-    st.error("No pude extraer texto de ese archivo. Probá con otro formato.")
+if not documentos:
+    st.error("No quedó ningún archivo válido para analizar.")
     st.stop()
 
-if texto_bruto is not None:
-    with st.expander("Ver texto extraído del archivo"):
-        st.text(texto_bruto[:5000] + ("..." if len(texto_bruto) > 5000 else ""))
+with st.expander(f"Ver texto extraído ({sum(1 for d in documentos if d['tipo'] == 'texto')} archivo(s) de texto)"):
+    for doc in documentos:
+        if doc["tipo"] == "texto":
+            st.markdown(f"**{doc['nombre']}**")
+            contenido = doc["contenido"]
+            st.text(contenido[:3000] + ("..." if len(contenido) > 3000 else ""))
 
 # ----------------------------------------------------------------------------
 # Botón principal: corre todo el pipeline
@@ -200,19 +219,12 @@ if not CATEGORIAS:
     st.warning("Definí al menos una categoría en la barra lateral.")
     st.stop()
 
-if st.button("🚀 Analizar documento", type="primary"):
+if st.button("🚀 Analizar documentos", type="primary"):
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key)
 
-    # ---------------- Paso "Bajar": extracción de argumentos (si hace falta) ----
-    if df_crudo is None:
-        bloques = dividir_en_bloques(texto_bruto)
-        st.write(f"Extrayendo argumentos de {len(bloques)} bloque(s) de texto...")
-        progreso = st.progress(0.0, text="Extrayendo argumentos...")
-        filas_extraidas = []
-
-        prompt_extraccion = """
+    prompt_extraccion = """
 Sos un asistente especializado en análisis documental. Tu tarea es construir una base de
 datos con los argumentos a favor y en contra de {tema}.
 
@@ -242,7 +254,33 @@ Texto a analizar:
 Devolvé solo el JSON, sin texto adicional.
 """
 
-        for i, bloque in enumerate(bloques):
+    # ---------------- Paso "Bajar": extracción de argumentos por documento ----
+    piezas_df = []
+
+    documentos_texto = [d for d in documentos if d["tipo"] == "texto"]
+    documentos_tabla = [d for d in documentos if d["tipo"] == "tabla"]
+
+    for doc in documentos_tabla:
+        df_pieza = doc["contenido"].copy()
+        df_pieza["Archivo fuente"] = doc["nombre"]
+        piezas_df.append(df_pieza)
+
+    if documentos_texto:
+        # Armamos todos los bloques de todos los documentos de texto en una sola lista,
+        # cada uno recordando de qué archivo vino, para poder mostrar progreso conjunto.
+        bloques_con_origen = []
+        for doc in documentos_texto:
+            for bloque in dividir_en_bloques(doc["contenido"]):
+                bloques_con_origen.append((doc["nombre"], bloque))
+
+        st.write(
+            f"Extrayendo argumentos de {len(documentos_texto)} documento(s) "
+            f"({len(bloques_con_origen)} bloque(s) de texto en total)..."
+        )
+        progreso = st.progress(0.0, text="Extrayendo argumentos...")
+        filas_extraidas = []
+
+        for i, (nombre_doc, bloque) in enumerate(bloques_con_origen):
             try:
                 response = client.chat.completions.create(
                     model=modelo,
@@ -255,22 +293,30 @@ Devolvé solo el JSON, sin texto adicional.
                     response_format={"type": "json_object"},
                 )
                 data = json.loads(response.choices[0].message.content)
-                filas_extraidas.extend(data.get("argumentos", []))
+                for fila in data.get("argumentos", []):
+                    fila["Archivo fuente"] = nombre_doc
+                    filas_extraidas.append(fila)
             except Exception as e:
-                st.warning(f"Bloque {i + 1}: no se pudo procesar ({e}).")
-            progreso.progress((i + 1) / len(bloques), text=f"Extrayendo... {i + 1}/{len(bloques)}")
+                st.warning(f"'{nombre_doc}', bloque {i + 1}: no se pudo procesar ({e}).")
+            progreso.progress(
+                (i + 1) / len(bloques_con_origen),
+                text=f"Extrayendo... {i + 1}/{len(bloques_con_origen)}",
+            )
 
         progreso.empty()
 
-        if not filas_extraidas:
-            st.error(
-                "No se encontraron argumentos en el documento. Probá con otro archivo o "
-                "revisá la descripción del tema."
-            )
-            st.stop()
+        if filas_extraidas:
+            piezas_df.append(pd.DataFrame(filas_extraidas))
 
-        df_crudo = pd.DataFrame(filas_extraidas)
-        st.success(f"Se extrajeron {len(df_crudo)} argumentos del documento.")
+    if not piezas_df:
+        st.error(
+            "No se encontraron argumentos en ninguno de los documentos. Probá con otros "
+            "archivos o revisá la descripción del tema."
+        )
+        st.stop()
+
+    df_crudo = pd.concat(piezas_df, ignore_index=True)
+    st.success(f"Se juntaron {len(df_crudo)} argumentos de {len(documentos)} archivo(s).")
 
     faltantes = [c for c in COLUMNAS_TEXTO if c not in df_crudo.columns]
     if faltantes:
